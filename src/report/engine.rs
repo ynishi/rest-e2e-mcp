@@ -7,10 +7,11 @@ use crate::types::SuiteResult;
 const DEFAULT_TEMPLATE: &str = include_str!("default.md.j2");
 
 /// スイート結果をテンプレートでレンダリングする。
+/// `body_max_lines`: None = 全文出力、Some(n) = n行に切り詰め。
 pub fn render(
     result: &SuiteResult,
     custom_template: Option<&str>,
-    body_max_lines: usize,
+    body_max_lines: Option<usize>,
 ) -> Result<String, String> {
     let mut env = Environment::new();
     env.add_function("truncate_lines", truncate_lines);
@@ -58,7 +59,7 @@ pub fn render(
         results => Value::from_serialize(&result.results),
         warnings => Value::from_serialize(&result.warnings),
         error_groups => Value::from_serialize(&error_groups),
-        body_max_lines => body_max_lines,
+        body_max_lines => body_max_lines.map(Value::from).unwrap_or(Value::UNDEFINED),
     };
 
     tmpl.render(ctx)
@@ -132,7 +133,7 @@ mod tests {
             make_test_result("テスト1", true, 200),
             make_test_result("テスト2", false, 500),
         ]);
-        let output = render(&suite, None, 6).unwrap();
+        let output = render(&suite, None, None).unwrap();
         assert!(output.contains("2 tests"));
         assert!(output.contains("1 passed"));
         assert!(output.contains("1 failed"));

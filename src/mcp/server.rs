@@ -24,9 +24,6 @@ use crate::types::{Failure, SuiteResult, TestResult, TestSuite, VarSource};
 use crate::variable::{resolve_variables, substitute, substitute_with_check};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30000;
-const DEFAULT_BODY_MAX_LINES: usize = 6;
-const RESPONSE_PREVIEW_LINES: usize = 10;
-
 // =============================================================================
 // Public entry point
 // =============================================================================
@@ -161,13 +158,16 @@ struct McpRunRequest {
     #[schemars(description = "Custom Jinja template path")]
     pub template: Option<String>,
 
-    #[schemars(description = "Max response body lines in report (default: 6)")]
+    #[schemars(description = "Max response body lines in report (default: unlimited)")]
     pub body_max_lines: Option<usize>,
 
     #[schemars(
-        description = "Output file path. If specified, write the report to this file in addition to returning it."
+        description = "Output file path. If not specified, auto-saves to $REST_E2E_SAVE_DIR or current directory."
     )]
     pub output_file: Option<String>,
+
+    #[schemars(description = "Skip writing output file (default: false)")]
+    pub no_output_file: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -220,7 +220,7 @@ impl ApiVerifierServer {
         let run_timeout_ms = req.timeout_ms; // None = 未指定（スイートレベルにフォールバック）
         let delay_ms = req.delay_ms.unwrap_or(0);
         let stop_on_failure = req.stop_on_failure.unwrap_or(false);
-        let body_max_lines = req.body_max_lines.unwrap_or(DEFAULT_BODY_MAX_LINES);
+        let body_max_lines = req.body_max_lines;
         let format = req.format.as_deref().unwrap_or("summary");
 
         let env_file = req.env_file.as_ref().map(PathBuf::from);
@@ -357,7 +357,6 @@ impl ApiVerifierServer {
 
                     let failures = check(req_def.expect.as_ref(), &resp);
                     let passed = failures.is_empty();
-                    let preview = truncate_body(&resp.body, RESPONSE_PREVIEW_LINES);
 
                     // 実際に送信されたヘッダーで上書き
                     let actual_headers = resp.actual_request_headers;
@@ -368,7 +367,7 @@ impl ApiVerifierServer {
                         passed,
                         elapsed_ms: resp.elapsed_ms,
                         failures,
-                        response_preview: preview,
+                        response_preview: resp.body,
                         request_method: req_def.method.clone(),
                         request_url: url,
                         request_headers: actual_headers,
@@ -491,11 +490,18 @@ impl ApiVerifierServer {
         }
 
         // ファイル出力（詳細レポート）
-        if let Some(ref out_path) = req.output_file {
+        let skip_file = req.no_output_file.unwrap_or(false);
+        if !skip_file {
+            let out_path = if let Some(ref explicit) = req.output_file {
+                PathBuf::from(explicit)
+            } else {
+                auto_output_path(req.file.as_deref())
+            };
+
             let detail = match format {
                 "json" => serde_json::to_string_pretty(&suite_result)
                     .map_err(|e| McpError::internal_error(format!("JSON error: {e}"), None))?,
-                "markdown" => {
+                _ => {
                     let custom_template = if let Some(tmpl_path) = &req.template {
                         let tmpl = std::fs::read_to_string(tmpl_path).map_err(|e| {
                             McpError::internal_error(format!("Template read error: {e}"), None)
@@ -507,11 +513,9 @@ impl ApiVerifierServer {
                     render(&suite_result, custom_template.as_deref(), body_max_lines)
                         .map_err(|e| McpError::internal_error(e, None))?
                 }
-                _ => summary.clone(),
             };
 
-            let path = PathBuf::from(out_path);
-            if let Some(parent) = path.parent()
+            if let Some(parent) = out_path.parent()
                 && !parent.as_os_str().is_empty()
             {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -522,7 +526,7 @@ impl ApiVerifierServer {
                 })?;
             }
             // Resolve .. and symlinks to prevent path traversal
-            let resolved = resolve_output_path(&path)
+            let resolved = resolve_output_path(&out_path)
                 .map_err(|e| McpError::internal_error(format!("Invalid output path: {e}"), None))?;
             std::fs::write(&resolved, &detail).map_err(|e| {
                 McpError::internal_error(format!("Failed to write output file: {e}"), None)
@@ -856,6 +860,30 @@ If 3 consecutive requests fail with the same error type (timeout, connection, dn
 // Helper functions
 // =============================================================================
 
+/// 出力ファイルパスを自動生成する。
+/// 優先順位: $REST_E2E_SAVE_DIR → カレントディレクトリ。
+/// ファイル名: {入力ファイルstem}-{YYYYMMDD-HHmmss}-result.md
+fn auto_output_path(input_file: Option<&str>) -> PathBuf {
+    let dir = std::env::var("REST_E2E_SAVE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+
+    let stem = input_file
+        .map(|f| {
+            std::path::Path::new(f)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("suite")
+                .to_string()
+        })
+        .unwrap_or_else(|| "inline".to_string());
+
+    let now = chrono::Local::now();
+    let ts = now.format("%Y%m%d-%H%M%S");
+
+    dir.join(format!("{stem}-{ts}-result.md"))
+}
+
 /// Bearer自動注入。
 /// API_KEY または BEARER_TOKEN が存在し、Authorizationヘッダーが未設定かつ
 /// no_auth でない場合に自動で付与する。
@@ -884,22 +912,6 @@ fn inject_bearer(
         }
     }
     None
-}
-
-/// レスポンスボディを指定行数に切り詰める。
-fn truncate_body(body: &str, max_lines: usize) -> String {
-    let lines: Vec<&str> = body.lines().collect();
-    if lines.len() <= max_lines {
-        body.to_string()
-    } else {
-        let truncated: Vec<&str> = lines[..max_lines].to_vec();
-        format!(
-            "{}\n... ({}行中 先頭{}行のみ表示)",
-            truncated.join("\n"),
-            lines.len(),
-            max_lines
-        )
-    }
 }
 
 /// フィルタ文字列でリクエストを絞り込む。

@@ -53,7 +53,7 @@
 {% endif %}
 {% if r.response_preview %}
 ```
-{% if r.passed %}{{ truncate_lines(r.response_preview, body_max_lines) }}{% else %}{{ truncate_lines(r.response_preview, body_max_lines * 5) }}{% endif %}
+{% if body_max_lines is defined %}{% if r.passed %}{{ truncate_lines(r.response_preview, body_max_lines) }}{% else %}{{ truncate_lines(r.response_preview, body_max_lines * 5) }}{% endif %}{% else %}{{ r.response_preview }}{% endif %}
 ```
 {% endif %}
 {% endif %}
