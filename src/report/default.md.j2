@@ -1,0 +1,60 @@
+# API検証結果
+
+{{ total }} tests: {{ passed }} passed, {{ failed }} failed{% if skipped > 0 %}, {{ skipped }} skipped{% endif %} ({{ elapsed_ms }}ms)
+{% if warnings %}
+
+## Warnings
+{% for w in warnings %}
+- {{ w }}
+{%- endfor %}
+{% endif %}
+{% if error_groups and error_groups | length > 0 %}
+
+## Error Summary
+{% for g in error_groups %}
+- {{ g.count }}件: {{ g.message }}
+{%- endfor %}
+{% endif %}
+
+{% if failed > 0 %}
+## 失敗テスト
+{% for r in results %}{% if not r.passed and not r.skipped %}
+- **{{ r.name }}**: {% if r.error_type %}{{ r.error_type }}{% else %}HTTP {{ r.status }}{% endif %}
+{%- for f in r.failures %}
+  - {{ f.check }}: expected={{ f.expected }}, actual={{ f.actual }}
+{%- endfor %}
+{% endif %}{% endfor %}
+{% endif %}
+
+## 全テスト結果
+{% for r in results %}
+### {{ r.name }}
+{% if r.skipped %}SKIP{% elif r.passed %}PASS{% else %}**FAIL**{% endif %} — {% if r.error_type %}{{ r.error_type }}{% else %}HTTP {{ r.status }}{% endif %} ({{ r.elapsed_ms }}ms)
+{% if not r.skipped %}
+**Request**
+```
+{{ r.request_method }} {{ r.request_url }}
+{% for k, v in r.request_headers|items %}{{ k }}: {{ v }}
+{% endfor %}
+```
+{% if r.request_body %}
+```json
+{{ r.request_body }}
+```
+{% endif %}
+
+**Response** {% if r.response_http_version %}{{ r.response_http_version }} {% endif %}{{ r.status }}{% if r.response_charset %} — charset: {{ r.response_charset }}{% endif %}{% if r.response_size_bytes > 0 %} — {{ r.response_size_bytes }} bytes{% endif %}
+
+{% if r.response_headers|length > 0 %}
+| Header | Value |
+|--------|-------|
+{% for k, v in r.response_headers|items %}| {{ k }} | {{ v }} |
+{% endfor %}
+{% endif %}
+{% if r.response_preview %}
+```
+{% if r.passed %}{{ truncate_lines(r.response_preview, body_max_lines) }}{% else %}{{ truncate_lines(r.response_preview, body_max_lines * 5) }}{% endif %}
+```
+{% endif %}
+{% endif %}
+{% endfor %}
