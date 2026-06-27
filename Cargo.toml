@@ -1,6 +1,6 @@
 [package]
 name = "rest-e2e-mcp"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "MCP server for AI-driven REST API end-to-end testing — use-case oriented, safe, efficient"
 license = "MIT OR Apache-2.0"
