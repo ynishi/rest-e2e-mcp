@@ -6,13 +6,16 @@ use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
-        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResult, Content, Implementation, ListResourcesResult,
+        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
+        ReadResourceResult, ServerCapabilities, ServerInfo,
     },
     service::{RequestContext, RoleServer},
     tool, tool_router,
     transport::stdio,
 };
+
+use super::resources;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -60,7 +63,10 @@ impl ServerHandler for ApiVerifierServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::V_2025_03_26,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
             server_info: Implementation {
                 name: "rest-e2e-mcp".to_string(),
                 title: Some("REST E2E MCP — API Verification Server".to_string()),
@@ -105,6 +111,27 @@ impl ServerHandler for ApiVerifierServer {
     ) -> Result<CallToolResult, McpError> {
         let tool_ctx = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tool_ctx).await
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(resources::list_all())
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        resources::read(&request.uri).ok_or_else(|| {
+            McpError::invalid_params(
+                format!("unknown resource uri: {}", request.uri),
+                None,
+            )
+        })
     }
 }
 

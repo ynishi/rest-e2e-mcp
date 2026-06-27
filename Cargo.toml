@@ -14,6 +14,9 @@ rust-version = "1.85"
 include = [
     "src/**/*.rs",
     "src/**/*.j2",
+    "resources/guides/*.md",
+    "resources/spec/*.yaml",
+    "resources/examples/*.yaml",
     "Cargo.toml",
     "README.md",
     "LICENSE-*",

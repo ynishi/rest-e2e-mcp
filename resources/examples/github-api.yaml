@@ -1,0 +1,42 @@
+# yaml-language-server: $schema=../spec/testsuite.schema.yaml
+#
+# Realistic example: probe the public GitHub REST API.
+# GITHUB_TOKEN can come from .env, the OS env, or the run tool's `variables`.
+
+variables:
+  BASE_URL: "https://api.github.com"
+  ACCEPT: "application/vnd.github+json"
+
+timeout_ms: 10000
+
+requests:
+  - name: "rate_limit reports core quota"
+    method: GET
+    url: "{{BASE_URL}}/rate_limit"
+    headers:
+      Accept: "{{ACCEPT}}"
+      Authorization: "Bearer ${GITHUB_TOKEN}"
+    expect:
+      status: 200
+      headers:
+        content-type: "application/json"
+      body_contains: ["core", "remaining"]
+    tags: [smoke, auth]
+
+  - name: "anonymous /zen returns text"
+    method: GET
+    url: "{{BASE_URL}}/zen"
+    no_auth: true
+    expect:
+      status: 200
+      body_not_contains: ["error"]
+    tags: [smoke]
+
+  - name: "GET unknown repo returns 404"
+    method: GET
+    url: "{{BASE_URL}}/repos/ynishi/this-repo-does-not-exist-xyz"
+    headers:
+      Accept: "{{ACCEPT}}"
+    expect:
+      status: [404, 403]
+    tags: [negative]

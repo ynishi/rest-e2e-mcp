@@ -1,0 +1,112 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://github.com/ynishi/rest-e2e-mcp/schemas/testsuite.yaml"
+title: TestSuite
+description: |
+  Top-level structure of a rest-e2e-mcp YAML test suite file.
+  Defines a list of HTTP requests with optional per-suite settings.
+  This document is the authoritative specification; guides under
+  rest-e2e://guide/* reference this schema.
+type: object
+required: [requests]
+additionalProperties: false
+properties:
+  variables:
+    type: object
+    description: |
+      Suite-level variables. Lowest priority among the four variable
+      sources (SuiteFile < DotEnv < OsEnv < Runtime).
+    additionalProperties:
+      type: string
+  timeout_ms:
+    type: integer
+    minimum: 0
+    description: |
+      Default request timeout in milliseconds.
+      Overridden by RequestDef.timeout_ms and by the run tool's timeout_ms.
+  requests:
+    type: array
+    description: Ordered list of HTTP requests to execute.
+    items:
+      $ref: "#/$defs/RequestDef"
+
+$defs:
+  RequestDef:
+    type: object
+    required: [name, method, url]
+    additionalProperties: false
+    properties:
+      name:
+        type: string
+        description: Human-readable test name. Surfaced in reports.
+      method:
+        type: string
+        enum: [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]
+      url:
+        type: string
+        description: |
+          Request URL. Supports {{VAR}}, $VAR, and ${VAR} interpolation
+          against the resolved variable set.
+      headers:
+        type: object
+        additionalProperties:
+          type: string
+      body:
+        type: string
+        description: Raw request body string (JSON, form, etc.).
+      expect:
+        $ref: "#/$defs/ExpectDef"
+      no_auth:
+        type: boolean
+        default: false
+        description: Disable automatic Bearer token injection for this request.
+      timeout_ms:
+        type: integer
+        minimum: 0
+        description: Per-request timeout. Overrides the suite-level timeout.
+      skip:
+        type: boolean
+        default: false
+      tags:
+        type: array
+        description: Tags consumed by the `@tag:<name>` run filter.
+        items:
+          type: string
+
+  ExpectDef:
+    type: object
+    additionalProperties: false
+    description: Assertions applied to the HTTP response.
+    properties:
+      status:
+        $ref: "#/$defs/StatusExpect"
+      headers:
+        type: object
+        description: |
+          Header assertions. Keys are matched case-insensitively;
+          values are substring-matched against the response header value.
+        additionalProperties:
+          type: string
+      body_contains:
+        type: array
+        description: Substrings the response body must contain.
+        items:
+          type: string
+      body_not_contains:
+        type: array
+        description: Substrings the response body must NOT contain.
+        items:
+          type: string
+
+  StatusExpect:
+    description: |
+      Expected HTTP status code. Either a single integer or an array
+      of acceptable codes (any-of match).
+    oneOf:
+      - type: integer
+        minimum: 100
+        maximum: 599
+      - type: array
+        items:
+          type: integer
+          minimum: 100
+          maximum: 599

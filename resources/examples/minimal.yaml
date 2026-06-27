@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=../spec/testsuite.schema.yaml
+#
+# Smallest passing rest-e2e-mcp suite.
+# Run with the `run` MCP tool: run(file: "minimal.yaml").
+
+variables:
+  BASE_URL: "https://httpbin.org"
+
+requests:
+  - name: "GET / returns 200 with url field"
+    method: GET
+    url: "{{BASE_URL}}/get"
+    expect:
+      status: 200
+      body_contains: ["url"]
