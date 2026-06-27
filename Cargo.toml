@@ -11,6 +11,13 @@ keywords = ["mcp", "rest-api", "e2e-testing", "ai", "test-automation"]
 categories = ["development-tools::testing", "command-line-utilities"]
 readme = "README.md"
 rust-version = "1.85"
+include = [
+    "src/**/*.rs",
+    "src/**/*.j2",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE-*",
+]
 
 [dependencies]
 rmcp = { version = "0.17", features = ["server", "transport-io", "macros"] }
