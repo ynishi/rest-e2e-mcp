@@ -11,19 +11,15 @@ use rmcp::model::{
 
 // ----------------------------- Embedded content -----------------------------
 
-const GETTING_STARTED: &str =
-    include_str!("../../resources/guides/getting-started.md");
+const GETTING_STARTED: &str = include_str!("../../resources/guides/getting-started.md");
 const YAML_FORMAT: &str = include_str!("../../resources/guides/yaml-format.md");
 const VARIABLES: &str = include_str!("../../resources/guides/variables.md");
 const ASSERTIONS: &str = include_str!("../../resources/guides/assertions.md");
 
-const SCHEMA_YAML: &str =
-    include_str!("../../resources/spec/testsuite.schema.yaml");
+const SCHEMA_YAML: &str = include_str!("../../resources/spec/testsuite.schema.yaml");
 
-const EXAMPLE_MINIMAL: &str =
-    include_str!("../../resources/examples/minimal.yaml");
-const EXAMPLE_GITHUB: &str =
-    include_str!("../../resources/examples/github-api.yaml");
+const EXAMPLE_MINIMAL: &str = include_str!("../../resources/examples/minimal.yaml");
+const EXAMPLE_GITHUB: &str = include_str!("../../resources/examples/github-api.yaml");
 
 // --------------------------------- Catalog ---------------------------------
 

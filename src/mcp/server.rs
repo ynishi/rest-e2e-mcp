@@ -127,10 +127,7 @@ impl ServerHandler for ApiVerifierServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         resources::read(&request.uri).ok_or_else(|| {
-            McpError::invalid_params(
-                format!("unknown resource uri: {}", request.uri),
-                None,
-            )
+            McpError::invalid_params(format!("unknown resource uri: {}", request.uri), None)
         })
     }
 }
