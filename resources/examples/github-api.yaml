@@ -21,6 +21,7 @@ requests:
       headers:
         content-type: "application/json"
       body_contains: ["core", "remaining"]
+      body_matches: ['"reset":\d+']
     tags: [smoke, auth]
 
   - name: "anonymous /zen returns text"

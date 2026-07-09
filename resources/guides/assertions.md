@@ -48,6 +48,26 @@ Both arrays are checked against the raw response body as a string. They
 do not parse JSON; combine them with `expect.headers` if you need to
 gate on content type first.
 
+## Body regex
+
+```yaml
+expect:
+  body_matches:
+    - "beforeSystemDate=\\d{4}-\\d{2}-\\d{2}"
+  body_not_matches:
+    - "^ERROR:"
+```
+
+- `body_matches` — every listed pattern must match somewhere in the body
+  (`Regex::is_match`, not a full-body anchor).
+- `body_not_matches` — none of the listed patterns may match anywhere in
+  the body.
+
+Patterns use [Rust `regex` crate](https://docs.rs/regex) syntax. They are
+validated when the suite file is loaded (`run` / `parse`); an invalid
+pattern fails fast with the offending pattern and request name in the
+error message, rather than being silently skipped at assertion time.
+
 ## Report semantics
 
 When any assertion fails, the request is marked failed in the report and

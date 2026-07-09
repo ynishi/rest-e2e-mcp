@@ -122,6 +122,10 @@ requests:
         - expected string
       body_not_contains:
         - error
+      body_matches:
+        - "beforeSystemDate=\\d{4}-\\d{2}-\\d{2}"   # Rust regex syntax
+      body_not_matches:
+        - "^ERROR:"
 ```
 
 ### Filtering
@@ -146,6 +150,16 @@ If `API_KEY` or `BEARER_TOKEN` is set in variables, it is automatically injected
 - **`json`** — structured `SuiteResult` for programmatic consumption
 
 Custom Jinja2 templates are supported via the `template` parameter.
+
+The `run` tool's `body_max_lines` parameter controls how much of each
+response body is shown in the report: left unset, the full body is
+included for every request (no truncation). When set, passing requests
+are truncated to `body_max_lines` lines and failing requests are allowed
+up to `body_max_lines * 5` lines (to preserve failure context). If a
+report body appears cut off with `body_max_lines` unset, the truncation
+is happening on the MCP client's display side, not in the report itself;
+setting `body_max_lines` explicitly gives predictable, server-side
+control over report length.
 
 ## License
 

@@ -774,6 +774,10 @@ requests:
         - 会社名
       body_not_contains:
         - error
+      body_matches:
+        - 'beforeSystemDate=\d{4}-\d{2}-\d{2}'
+      body_not_matches:
+        - '"status":\s*"(failed|error)"'
 
   - name: スキップするテスト
     method: GET

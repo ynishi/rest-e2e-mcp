@@ -96,6 +96,21 @@ $defs:
         description: Substrings the response body must NOT contain.
         items:
           type: string
+      body_matches:
+        type: array
+        description: |
+          Regular expressions (Rust regex syntax) the response body must
+          match. Each pattern is searched against the whole body (is_match).
+        items:
+          type: string
+      body_not_matches:
+        type: array
+        description: |
+          Regular expressions (Rust regex syntax) the response body must
+          NOT match. Each pattern is searched against the whole body
+          (is_match).
+        items:
+          type: string
 
   StatusExpect:
     description: |

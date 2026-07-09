@@ -35,6 +35,8 @@ the schema wins.
 | `headers`           | `map<string,string>` | Case-insensitive key match, substring value match. |
 | `body_contains`     | `string[]`           | Each substring must appear in the body. |
 | `body_not_contains` | `string[]`           | None of these substrings may appear in the body. |
+| `body_matches`      | `string[]`           | Each regex (Rust regex syntax) must match somewhere in the body. |
+| `body_not_matches`  | `string[]`           | None of these regexes may match anywhere in the body. |
 
 ## StatusExpect
 

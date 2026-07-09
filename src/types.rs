@@ -81,6 +81,14 @@ pub struct ExpectDef {
     /// ボディに含まれてはいけない文字列。
     #[serde(default)]
     pub body_not_contains: Vec<String>,
+
+    /// ボディがマッチすべき正規表現（Rust regex構文）。ボディ全体に対して検索 (is_match) する。
+    #[serde(default)]
+    pub body_matches: Vec<String>,
+
+    /// ボディがマッチしてはいけない正規表現（Rust regex構文）。ボディ全体に対して検索 (is_match) する。
+    #[serde(default)]
+    pub body_not_matches: Vec<String>,
 }
 
 /// 期待ステータスコード。単一値 or 複数値。

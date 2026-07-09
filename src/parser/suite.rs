@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use regex::Regex;
+
 use crate::types::TestSuite;
 
 /// YAMLファイルからテストスイートを読み込む。
@@ -11,7 +13,38 @@ pub fn load_suite(path: &Path) -> Result<TestSuite, String> {
 
 /// YAML文字列からテストスイートをパースする。
 pub fn load_suite_str(content: &str) -> Result<TestSuite, String> {
-    serde_yml::from_str(content).map_err(|e| format!("YAML parse error: {e}"))
+    let suite: TestSuite =
+        serde_yml::from_str(content).map_err(|e| format!("YAML parse error: {e}"))?;
+    validate_regex_patterns(&suite)?;
+    Ok(suite)
+}
+
+/// `body_matches` / `body_not_matches` に指定された正規表現パターンが
+/// 全てコンパイル可能かを検証する。不正なパターンは silent skip せず、
+/// 該当パターンとリクエスト名を含む明示エラーを返す。
+fn validate_regex_patterns(suite: &TestSuite) -> Result<(), String> {
+    for req in &suite.requests {
+        let Some(expect) = &req.expect else {
+            continue;
+        };
+        for pattern in &expect.body_matches {
+            if let Err(e) = Regex::new(pattern) {
+                return Err(format!(
+                    "Invalid regex in body_matches for request \"{}\": pattern \"{pattern}\" — {e}",
+                    req.name
+                ));
+            }
+        }
+        for pattern in &expect.body_not_matches {
+            if let Err(e) = Regex::new(pattern) {
+                return Err(format!(
+                    "Invalid regex in body_not_matches for request \"{}\": pattern \"{pattern}\" — {e}",
+                    req.name
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -152,5 +185,62 @@ requests:
 "#;
         let suite = load_suite_str(yaml).unwrap();
         assert_eq!(suite.timeout_ms, None);
+    }
+
+    #[test]
+    fn load_body_matches_and_not_matches() {
+        let yaml = r#"
+requests:
+  - name: 日付チェック
+    method: GET
+    url: https://example.com/api/status
+    expect:
+      status: 200
+      body_matches:
+        - "beforeSystemDate=\\d{4}-\\d{2}-\\d{2}"
+      body_not_matches:
+        - "^ERROR:"
+"#;
+        let suite = load_suite_str(yaml).unwrap();
+        let expect = suite.requests[0].expect.as_ref().unwrap();
+        assert_eq!(
+            expect.body_matches,
+            vec![r"beforeSystemDate=\d{4}-\d{2}-\d{2}"]
+        );
+        assert_eq!(expect.body_not_matches, vec!["^ERROR:"]);
+    }
+
+    #[test]
+    fn invalid_body_matches_regex_returns_explicit_error() {
+        let yaml = r#"
+requests:
+  - name: 壊れた正規表現
+    method: GET
+    url: https://example.com
+    expect:
+      body_matches:
+        - "(unclosed"
+"#;
+        let err = load_suite_str(yaml).unwrap_err();
+        assert!(err.contains("(unclosed"), "error was: {err}");
+        assert!(err.contains("壊れた正規表現"), "error was: {err}");
+        assert!(err.contains("body_matches"), "error was: {err}");
+    }
+
+    #[test]
+    fn invalid_body_not_matches_regex_returns_explicit_error() {
+        let yaml = r#"
+requests:
+  - name: 壊れた否定正規表現
+    method: GET
+    url: https://example.com
+    expect:
+      body_not_matches:
+        - "[unclosed"
+"#;
+        let err = load_suite_str(yaml).unwrap_err();
+        assert!(err.contains("[unclosed"), "error was: {err}");
+        assert!(err.contains("壊れた否定正規表現"), "error was: {err}");
+        assert!(err.contains("body_not_matches"), "error was: {err}");
     }
 }

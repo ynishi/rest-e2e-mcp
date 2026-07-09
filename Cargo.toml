@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 authors = ["Yutaka Nishimura"]
 repository = "https://github.com/ynishi/rest-e2e-mcp"
 homepage = "https://github.com/ynishi/rest-e2e-mcp"
+documentation = "https://docs.rs/rest-e2e-mcp"
 keywords = ["mcp", "rest-api", "e2e-testing", "ai", "test-automation"]
 categories = ["development-tools::testing", "command-line-utilities"]
 readme = "README.md"
@@ -25,6 +26,7 @@ include = [
 [dependencies]
 rmcp = { version = "0.17", features = ["server", "transport-io", "macros"] }
 schemars = "1.2"
+regex = "1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
 encoding_rs = "0.8"
