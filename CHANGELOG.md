@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.0] — 2026-07-09
+
+### Added
+
+- `expect.body_matches` / `expect.body_not_matches`: regex-based body
+  assertions (Rust `regex` syntax, matched against the whole response
+  body). Useful for variable values such as timestamps, e.g.
+  `body_matches: ['beforeSystemDate=\d{4}-\d{2}-\d{2}']`. Patterns are
+  validated at suite parse time — an invalid pattern fails parsing with
+  an explicit error carrying the request name and the offending
+  pattern. Reflected in the `schema` output, the `help` guide, the
+  bundled guides (`assertions`, `yaml-format`), the TestSuite schema
+  spec, and the `github-api` example.
+
+### Changed
+
+- README now documents the `body_max_lines` default for `run`: when
+  unset, `response_preview` in reports contains the full response body;
+  apparent truncation typically comes from the MCP client display, and
+  `body_max_lines` can be set to control line count explicitly.
+- `Cargo.toml` now declares the `documentation` metadata field
+  (docs.rs).
+
 ## [0.2.0] — 2026-06-27
 
 ### Added
