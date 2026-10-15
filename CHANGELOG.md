@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Secret references (#1): a variable value may be `keychain://<service>/<account>`
+  (macOS `security`) or `op://<vault>/<item>/<field>` (1Password `op`). A
+  reference is resolved at run time only if it matches a server-side
+  `--secret-ref-allow <pattern>` flag (repeatable, `*` wildcard); with no flag
+  nothing is resolved. Sources (`.env`, suite `variables`, runtime `variables`)
+  are not trusted. At startup the effective allowlist is printed to stderr,
+  with a warning for patterns that are `*` or lack a known scheme prefix.
+- Failure handling: a reference that is not allowed or cannot be resolved fails
+  the requests that use the variable with `SecretResolutionFailed` (also for
+  `${NAME:default}`), never falling back to the literal reference or a default.
+  Each CLI call has a 10 s timeout (process group killed on timeout or oversized output) and a 64 KiB output cap, and all references of
+  one call share a 30 s budget.
+- Output masking: resolved secrets and the values of `API_KEY` /
+  `BEARER_TOKEN` are replaced with `***` (secrets of 8+ characters, in raw,
+  percent-encoded, form-encoded, URL-parser-encoded (query, path, fragment,
+  userinfo) and JSON-escaped forms)
+  in reports, `config`, errors and responses. `Authorization` header values are
+  always masked. Header names are not masked.
+- `config` shows references and resolved length (never the value) and
+  `auto-bearer: BLOCKED (...)` when the selected auto-bearer variable failed;
+  `parse` never runs secret CLIs.
+- `libc` dependency (unix only) to kill the secret CLI process group.
+- Rust API: new `secret` module; `ResolveMode`, `resolve_variables_with`,
+  `resolve_variables_in` (backend, allowlist and time budget injectable) and
+  `substitute_with_check_failed` are exported from `variable`. New public type
+  `ResolveFailure` (`SecretResolutionFailed`).
+
+### Changed
+
+- Report and `config` output now mask `Authorization` and literal `API_KEY` /
+  `BEARER_TOKEN` values; output that previously contained them shows `***`.
+- A variable whose secret resolution failed is reported once, as
+  `SecretResolutionFailed`, not additionally in the `Unresolved variables`
+  warning.
+- Auto-bearer does not fall back from a failed `API_KEY` to `BEARER_TOKEN`; the
+  request fails instead.
+
+### Breaking (Rust API)
+
+- `rest_e2e_mcp::mcp::run` now takes `secret_ref_allow: Vec<String>`.
+- `VarTrace` gained the public fields `secret` and `reference`; `ResolvedVars`
+  gained `failures`.
+- `resolve_variables` keeps its signature but now yields `failures` for secret
+  references (the default allowlist is empty, so references fail); use
+  `resolve_variables_with` / `resolve_variables_in` to inject a backend and
+  allowlist.
+
 ## [0.3.0] — 2026-07-09
 
 ### Added

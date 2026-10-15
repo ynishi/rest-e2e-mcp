@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use rmcp::{
@@ -23,16 +24,27 @@ use crate::assert::check;
 use crate::http::{RequestError, build_client, execute_request};
 use crate::parser::load_suite;
 use crate::report::render;
-use crate::types::{Failure, SuiteResult, TestResult, TestSuite, VarSource};
-use crate::variable::{resolve_variables, substitute, substitute_with_check};
+use crate::secret::{CliBackend, MASK, Masker, SecretAllowlist, SecretBackend, is_reference};
+use crate::types::{
+    Failure, ResolveFailure, ResolvedVars, SuiteResult, TestResult, TestSuite, VarTrace,
+};
+use crate::variable::{
+    ResolveMode, load_dotenv, resolve_variables_in, substitute, substitute_with_check_failed,
+};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30000;
 // =============================================================================
 // Public entry point
 // =============================================================================
 
-pub async fn run() -> anyhow::Result<()> {
-    let server = ApiVerifierServer::new();
+/// Start the MCP server. `secret_ref_allow` holds the `--secret-ref-allow`
+/// patterns: secret references are resolved only if they match one of them.
+pub async fn run(secret_ref_allow: Vec<String>) -> anyhow::Result<()> {
+    // stderr only: stdout is the MCP stdio transport.
+    for line in crate::secret::allowlist_report(&secret_ref_allow) {
+        eprintln!("{line}");
+    }
+    let server = ApiVerifierServer::new(SecretCtx::real(SecretAllowlist::new(secret_ref_allow)));
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -42,16 +54,72 @@ pub async fn run() -> anyhow::Result<()> {
 // MCP Server
 // =============================================================================
 
+type OsEnvFn = dyn Fn(&str) -> Option<String> + Send + Sync;
+
+/// Everything variable resolution needs besides the request itself.
+#[derive(Clone)]
+struct SecretCtx {
+    allow: Arc<SecretAllowlist>,
+    backend: Arc<dyn SecretBackend>,
+    os_env: Arc<OsEnvFn>,
+    /// Overall time budget for resolving all references of one call.
+    budget: std::time::Duration,
+}
+
+impl SecretCtx {
+    fn real(allow: SecretAllowlist) -> Self {
+        Self {
+            allow: Arc::new(allow),
+            backend: Arc::new(CliBackend::default()),
+            os_env: Arc::new(|n| std::env::var(n).ok()),
+            budget: crate::secret::RESOLVE_DEADLINE,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ApiVerifierServer {
     tool_router: ToolRouter<Self>,
+    secrets: SecretCtx,
 }
 
 impl ApiVerifierServer {
-    fn new() -> Self {
+    fn new(secrets: SecretCtx) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            secrets,
         }
+    }
+
+    /// Resolve variables. Secret CLIs may block, so this runs on the blocking pool
+    /// (each CLI call is additionally bounded by a timeout). `ReferencesAsIs`
+    /// never invokes a backend and runs inline.
+    async fn resolve(
+        &self,
+        runtime_vars: HashMap<String, String>,
+        suite_vars: HashMap<String, String>,
+        env_file: Option<PathBuf>,
+        mode: ResolveMode,
+    ) -> Result<ResolvedVars, McpError> {
+        let ctx = self.secrets.clone();
+        let work = move || {
+            resolve_variables_in(
+                &runtime_vars,
+                &suite_vars,
+                env_file.as_deref(),
+                &*ctx.os_env,
+                &*ctx.backend,
+                &ctx.allow,
+                mode,
+                ctx.budget,
+            )
+        };
+        if mode == ResolveMode::ReferencesAsIs {
+            return Ok(work());
+        }
+        tokio::task::spawn_blocking(work)
+            .await
+            .map_err(|e| McpError::internal_error(format!("variable resolution failed: {e}"), None))
     }
 }
 
@@ -256,22 +324,52 @@ impl ApiVerifierServer {
         // インラインリクエスト（スイートなし → run指定 or デフォルト）
         let inline_timeout = run_timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         if let Some(inline) = &req.request {
-            let resolved = resolve_variables(&runtime_vars, &HashMap::new(), env_file.as_deref());
-            let url = substitute(&inline.url, &resolved.vars);
+            let resolved = self
+                .resolve(
+                    runtime_vars.clone(),
+                    HashMap::new(),
+                    env_file.clone(),
+                    ResolveMode::Resolve,
+                )
+                .await?;
+            let failed_names = failed_names(&resolved);
+            let masker = Masker::new(resolved.secret_values());
+            let mut unresolved: Vec<String> = Vec::new();
+            let mut sub = |t: &str| {
+                let r = substitute_with_check_failed(t, &resolved.vars, &failed_names);
+                unresolved.extend(r.unresolved);
+                r.text
+            };
+            let url = sub(&inline.url);
             let mut headers: HashMap<String, String> = inline
                 .headers
                 .clone()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|(k, v)| (k, substitute(&v, &resolved.vars)))
+                .map(|(k, v)| {
+                    let nv = sub(&v);
+                    (k, nv)
+                })
                 .collect();
+            let body = inline.body.as_deref().map(&mut sub);
+
+            let blocked = blocking_failures(
+                &resolved.failures,
+                &resolved.vars,
+                &unresolved,
+                &headers,
+                false,
+            );
+            if !blocked.is_empty() {
+                let msg = blocked
+                    .iter()
+                    .map(|f| f.to_failure().actual)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(McpError::internal_error(masker.mask_str(&msg), None));
+            }
 
             inject_bearer(&mut headers, &resolved.vars, false);
-
-            let body = inline
-                .body
-                .as_deref()
-                .map(|b| substitute(b, &resolved.vars));
 
             let response = execute_request(
                 &client,
@@ -282,8 +380,10 @@ impl ApiVerifierServer {
                 inline_timeout,
             )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::internal_error(masker.mask_str(&e.to_string()), None))?;
 
+            let mut response = response;
+            masker.mask_response(&mut response);
             let result_json = serde_json::to_string_pretty(&response)
                 .map_err(|e| McpError::internal_error(format!("JSON error: {e}"), None))?;
 
@@ -298,7 +398,16 @@ impl ApiVerifierServer {
         let suite =
             load_suite(&PathBuf::from(file_path)).map_err(|e| McpError::internal_error(e, None))?;
 
-        let resolved = resolve_variables(&runtime_vars, &suite.variables, env_file.as_deref());
+        let resolved = self
+            .resolve(
+                runtime_vars.clone(),
+                suite.variables.clone(),
+                env_file.clone(),
+                ResolveMode::Resolve,
+            )
+            .await?;
+        let failed_names = failed_names(&resolved);
+        let masker = Masker::new(resolved.secret_values());
 
         // タイムアウト解決: run指定 > YAML suite > デフォルト
         let suite_timeout =
@@ -341,7 +450,10 @@ impl ApiVerifierServer {
             }
 
             // 変数展開（未解決変数を追跡）
-            let url_result = substitute_with_check(&req_def.url, &resolved.vars);
+            let mut req_unresolved: Vec<String> = Vec::new();
+            let url_result =
+                substitute_with_check_failed(&req_def.url, &resolved.vars, &failed_names);
+            req_unresolved.extend(url_result.unresolved.iter().cloned());
             all_unresolved.extend(url_result.unresolved);
             let url = url_result.text;
 
@@ -349,19 +461,54 @@ impl ApiVerifierServer {
                 .headers
                 .iter()
                 .map(|(k, v)| {
-                    let r = substitute_with_check(v, &resolved.vars);
+                    let r = substitute_with_check_failed(v, &resolved.vars, &failed_names);
+                    req_unresolved.extend(r.unresolved.iter().cloned());
                     all_unresolved.extend(r.unresolved);
                     (k.clone(), r.text)
                 })
                 .collect();
 
-            inject_bearer(&mut headers, &resolved.vars, req_def.no_auth);
-
             let body = req_def.body.as_deref().map(|b| {
-                let r = substitute_with_check(b, &resolved.vars);
+                let r = substitute_with_check_failed(b, &resolved.vars, &failed_names);
+                req_unresolved.extend(r.unresolved.iter().cloned());
                 all_unresolved.extend(r.unresolved);
                 r.text
             });
+
+            // シークレット参照の解決失敗: 該当変数を使うリクエストは送信せず失敗させる
+            let blocked = blocking_failures(
+                &resolved.failures,
+                &resolved.vars,
+                &req_unresolved,
+                &headers,
+                req_def.no_auth,
+            );
+            if !blocked.is_empty() {
+                results.push(TestResult {
+                    name: req_def.name.clone(),
+                    status: 0,
+                    passed: false,
+                    elapsed_ms: 0,
+                    failures: blocked.iter().map(|f| f.to_failure()).collect(),
+                    response_preview: String::new(),
+                    request_method: req_def.method.clone(),
+                    request_url: url,
+                    request_headers: headers,
+                    request_body: body,
+                    response_headers: HashMap::new(),
+                    response_http_version: String::new(),
+                    response_charset: None,
+                    response_size_bytes: 0,
+                    skipped: false,
+                    error_type: Some("secret_resolution".to_string()),
+                });
+                if stop_on_failure {
+                    break;
+                }
+                continue;
+            }
+
+            inject_bearer(&mut headers, &resolved.vars, req_def.no_auth);
 
             let req_timeout = req_def.timeout_ms.unwrap_or(suite_timeout);
 
@@ -471,6 +618,8 @@ impl ApiVerifierServer {
         let skipped = results.iter().filter(|r| r.skipped).count();
 
         // 未解決変数の警告生成
+        // Failed secret references are reported once, as SecretResolutionFailed.
+        all_unresolved.retain(|n| !failed_names.contains(n));
         all_unresolved.sort();
         all_unresolved.dedup();
         if !all_unresolved.is_empty() {
@@ -480,7 +629,7 @@ impl ApiVerifierServer {
             ));
         }
 
-        let suite_result = SuiteResult {
+        let mut suite_result = SuiteResult {
             total: results.len(),
             passed,
             failed,
@@ -489,6 +638,9 @@ impl ApiVerifierServer {
             results,
             warnings,
         };
+
+        // テンプレート/JSON/サマリに渡る前にマスクする
+        masker.mask_suite(&mut suite_result);
 
         // サマリ（MCPレスポンス用 — 常にこれだけ返す）
         let mut summary = format!(
@@ -584,16 +736,41 @@ impl ApiVerifierServer {
 
         if resolve {
             let env_file = req.env_file.as_ref().map(PathBuf::from);
-            let resolved =
-                resolve_variables(&HashMap::new(), &suite.variables, env_file.as_deref());
+            // parse never invokes secret CLIs: references are shown unresolved.
+            let resolved = self
+                .resolve(
+                    HashMap::new(),
+                    suite.variables.clone(),
+                    env_file,
+                    ResolveMode::ReferencesAsIs,
+                )
+                .await?;
 
             let mut output = format!("Variables ({}):\n", resolved.vars.len());
+            let masker = Masker::new(resolved.secret_values());
+            let secret_names: std::collections::HashSet<&str> = resolved
+                .traces
+                .iter()
+                .filter(|t| t.secret)
+                .map(|t| t.name.as_str())
+                .collect();
             for (k, v) in &resolved.vars {
-                output.push_str(&format!("  {k} = {v}\n"));
+                let is_ref = resolved
+                    .traces
+                    .iter()
+                    .any(|t| t.name == *k && t.reference.is_some());
+                let shown = if secret_names.contains(k.as_str()) {
+                    MASK.to_string()
+                } else if is_ref {
+                    format!("{v} (reference, not resolved)")
+                } else {
+                    masker.mask_str(v)
+                };
+                output.push_str(&format!("  {k} = {shown}\n"));
             }
             output.push_str(&format!("\nRequests ({}):\n", suite.requests.len()));
             for (i, r) in suite.requests.iter().enumerate() {
-                let url = substitute(&r.url, &resolved.vars);
+                let url = masker.mask_str(&substitute(&r.url, &resolved.vars));
                 let status_info = r
                     .expect
                     .as_ref()
@@ -644,70 +821,60 @@ impl ApiVerifierServer {
             HashMap::new()
         };
 
-        let resolved = resolve_variables(&runtime_vars, &suite_vars, env_file.as_deref());
+        let resolved = self
+            .resolve(
+                runtime_vars,
+                suite_vars.clone(),
+                env_file,
+                ResolveMode::Resolve,
+            )
+            .await?;
 
-        // フィルタ適用
-        let traces = if let Some(filter) = &req.filter {
-            let pattern = normalize_pattern(filter);
-            resolved
-                .traces
-                .into_iter()
-                .filter(|t| matches_simple_pattern(&t.name, &pattern))
-                .collect()
-        } else {
-            resolved.traces
+        // フィルタ適用（変数行・失敗行・.env件数で共通）
+        let pattern = req.filter.as_deref().map(normalize_pattern);
+        let selected = |name: &str| {
+            pattern
+                .as_deref()
+                .is_none_or(|p| matches_simple_pattern(name, p))
         };
+        let traces: Vec<&VarTrace> = resolved
+            .traces
+            .iter()
+            .filter(|t| selected(&t.name))
+            .collect();
 
         // Mise風出力
         let mut output = String::new();
 
         for trace in &traces {
-            let chain: Vec<String> = trace
-                .found_in
-                .iter()
-                .map(|(src, val)| {
-                    let marker = if *src == trace.source { "here" } else { val };
-                    format!("{src}({marker})")
-                })
-                .collect();
-
-            let display_value = if trace.value.chars().count() > 40 {
-                let truncated: String = trace.value.chars().take(37).collect();
-                format!("{truncated}...")
-            } else {
-                trace.value.clone()
-            };
-
-            output.push_str(&format!(
-                "${:<20} = {:<42} ({})\n",
-                trace.name,
-                display_value,
-                chain.join(" -> ")
-            ));
+            output.push_str(&format_trace_line(trace));
+            output.push('\n');
+        }
+        for f in resolved.failures.iter().filter(|f| selected(f.name())) {
+            output.push_str(&format!("! {}\n", f.to_failure().actual));
         }
 
         // Bearer自動注入状態
-        let bearer_var = if resolved.vars.contains_key("API_KEY") {
-            Some("API_KEY")
-        } else if resolved.vars.contains_key("BEARER_TOKEN") {
-            Some("BEARER_TOKEN")
-        } else {
-            None
-        };
-
         output.push('\n');
-        if let Some(var) = bearer_var {
-            output.push_str(&format!("auto-bearer: ON (from ${var})\n"));
-        } else {
-            output.push_str("auto-bearer: OFF (no $API_KEY or $BEARER_TOKEN found)\n");
+        match bearer_plan(&resolved.vars, &resolved.failures) {
+            BearerPlan::Use(var) => {
+                output.push_str(&format!("auto-bearer: ON (from ${var})\n"));
+            }
+            BearerPlan::Blocked(var) => output.push_str(&format!(
+                "auto-bearer: BLOCKED ({var} secret resolution failed)\n"
+            )),
+            BearerPlan::Off => {
+                output.push_str("auto-bearer: OFF (no $API_KEY or $BEARER_TOKEN found)\n");
+            }
         }
 
         // ファイルロード情報
         output.push('\n');
         if let Some(env_path) = &req.env_file {
-            let count = traces
-                .iter()
-                .filter(|t| t.found_in.iter().any(|(s, _)| *s == VarSource::DotEnv))
+            // 解決に失敗した変数は traces に入らないため、.env の変数名から数える
+            let count = load_dotenv(Some(std::path::Path::new(env_path)))
+                .keys()
+                .filter(|n| selected(n))
                 .count();
             output.push_str(&format!("files: .env={env_path} ({count} vars)\n"));
         }
@@ -805,6 +972,16 @@ requests:
 
 If `$API_KEY` or `$BEARER_TOKEN` is set, `Authorization: Bearer <token>` is automatically added.
 Disable per-request with `no_auth: true`.
+
+## Secret References
+
+A variable value may be `keychain://<service>/<account>` or `op://<vault>/<item>/<field>`.
+It is resolved only if it matches a server-side `--secret-ref-allow <pattern>` flag
+(repeatable; exact reference or `*` wildcard), whatever its source. Not allowed or
+unresolvable => requests using it fail with `SecretResolutionFailed` (no default
+fallback, the reference is never sent). Resolved values and `API_KEY` / `BEARER_TOKEN`
+are masked (`***`) in all output, including percent-encoded and JSON-escaped forms
+(base64 etc. are not masked). `parse` never resolves references.
 
 ## Timeout
 
@@ -910,6 +1087,110 @@ fn auto_output_path(input_file: Option<&str>) -> PathBuf {
     let ts = now.format("%Y%m%d-%H%M%S");
 
     dir.join(format!("{stem}-{ts}-result.md"))
+}
+
+/// 解決に失敗した変数名。
+fn failed_names(resolved: &ResolvedVars) -> Vec<String> {
+    resolved
+        .failures
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect()
+}
+
+/// 1変数ぶんの config 出力行。シークレットの値は決して出力しない。
+fn format_trace_line(trace: &VarTrace) -> String {
+    let chain: Vec<String> = trace
+        .found_in
+        .iter()
+        .map(|(src, val)| {
+            let marker = if *src == trace.source {
+                "here".to_string()
+            } else if trace.secret && !is_reference(val) {
+                MASK.to_string()
+            } else {
+                val.clone()
+            };
+            format!("{src}({marker})")
+        })
+        .collect();
+
+    let display_value = if let Some(reference) = &trace.reference
+        && trace.secret
+    {
+        format!(
+            "{reference} -> <resolved, {} chars>",
+            trace.value.chars().count()
+        )
+    } else if trace.secret {
+        MASK.to_string()
+    } else if trace.reference.is_some() {
+        // 未解決の参照文字列はシークレットではないのでそのまま表示する
+        format!("{} (reference, not resolved)", trace.value)
+    } else if trace.value.chars().count() > 40 {
+        let truncated: String = trace.value.chars().take(37).collect();
+        format!("{truncated}...")
+    } else {
+        trace.value.clone()
+    };
+
+    format!(
+        "${:<20} = {:<42} ({})",
+        trace.name,
+        display_value,
+        chain.join(" -> ")
+    )
+}
+
+/// Bearer 自動注入の判定（`inject_bearer` の変数選択と同一）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BearerPlan {
+    /// 注入に使える変数が無い。
+    Off,
+    /// この変数の値で注入される。
+    Use(&'static str),
+    /// 選ばれる変数のシークレット解決が失敗している（別変数へ黙って
+    /// フォールバックしない）。
+    Blocked(&'static str),
+}
+
+/// `inject_bearer` と同じ順序（API_KEY → BEARER_TOKEN）で変数を選ぶ。
+/// API_KEY が失敗なら BEARER_TOKEN へフォールバックせずブロックする。
+fn bearer_plan(vars: &HashMap<String, String>, failures: &[ResolveFailure]) -> BearerPlan {
+    for var in ["API_KEY", "BEARER_TOKEN"] {
+        if failures.iter().any(|f| f.name() == var) {
+            return BearerPlan::Blocked(var);
+        }
+        if vars.contains_key(var) {
+            return BearerPlan::Use(var);
+        }
+    }
+    BearerPlan::Off
+}
+
+/// このリクエストの実行を妨げるシークレット解決失敗を返す。
+///
+/// - リクエスト内で参照された（未解決になった）変数が失敗した変数である場合
+/// - Bearer 自動注入が有効で、[`bearer_plan`] が選ぶ変数の解決が失敗している場合
+fn blocking_failures<'a>(
+    failures: &'a [ResolveFailure],
+    vars: &HashMap<String, String>,
+    unresolved: &[String],
+    headers: &HashMap<String, String>,
+    no_auth: bool,
+) -> Vec<&'a ResolveFailure> {
+    let bearer_applies = !no_auth
+        && !headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("authorization"));
+    let blocked_bearer = match bearer_plan(vars, failures) {
+        BearerPlan::Blocked(v) if bearer_applies => Some(v),
+        _ => None,
+    };
+    failures
+        .iter()
+        .filter(|f| unresolved.iter().any(|u| u == f.name()) || blocked_bearer == Some(f.name()))
+        .collect()
 }
 
 /// Bearer自動注入。
@@ -1128,5 +1409,679 @@ mod tests {
         assert!(!matches_simple_pattern("json_export", "*csv*"));
         assert!(matches_simple_pattern("test_foo", "test_*"));
         assert!(!matches_simple_pattern("my_test_foo", "test_*"));
+    }
+
+    // ---- secret references -------------------------------------------------
+
+    use crate::secret::SecretBackend;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Fake backend that records every call.
+    struct Rec {
+        reply: Result<String, String>,
+        calls: Mutex<Vec<String>>,
+    }
+    impl Rec {
+        fn ok(v: &str) -> Arc<Self> {
+            Arc::new(Self {
+                reply: Ok(v.to_string()),
+                calls: Default::default(),
+            })
+        }
+        fn err() -> Arc<Self> {
+            Arc::new(Self {
+                reply: Err("backend failed".to_string()),
+                calls: Default::default(),
+            })
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+    impl SecretBackend for Rec {
+        fn resolve(&self, reference: &str) -> Result<String, String> {
+            self.calls.lock().unwrap().push(reference.to_string());
+            self.reply.clone()
+        }
+    }
+
+    fn server_with(allow: &[&str], backend: Arc<Rec>) -> ApiVerifierServer {
+        ApiVerifierServer::new(SecretCtx {
+            allow: Arc::new(SecretAllowlist::new(allow.iter().map(|s| s.to_string()))),
+            backend,
+            // hermetic: the host OS environment is never consulted
+            os_env: Arc::new(|_| None),
+            budget: crate::secret::RESOLVE_DEADLINE,
+        })
+    }
+
+    fn tmp_file(content: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f
+    }
+
+    fn result_text(res: &CallToolResult) -> String {
+        let v = serde_json::to_value(res).unwrap();
+        v["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    fn no_os(_: &str) -> Option<String> {
+        None
+    }
+
+    fn resolve_plain(
+        runtime: &HashMap<String, String>,
+        suite: &HashMap<String, String>,
+        backend: &dyn SecretBackend,
+        allow: &[&str],
+        mode: ResolveMode,
+        env_file: Option<&std::path::Path>,
+    ) -> ResolvedVars {
+        resolve_variables_in(
+            runtime,
+            suite,
+            env_file,
+            &no_os,
+            backend,
+            &SecretAllowlist::new(allow.iter().map(|s| s.to_string())),
+            mode,
+            crate::secret::RESOLVE_DEADLINE,
+        )
+    }
+
+    #[test]
+    fn config_line_shows_reference_and_length_never_value() {
+        let secret = "resolved-secret-value-42";
+        let f = tmp_file("API_KEY=keychain://svc/acct\n");
+        let r = resolve_plain(
+            &HashMap::new(),
+            &HashMap::new(),
+            &*Rec::ok(secret),
+            &["keychain://svc/*"],
+            ResolveMode::Resolve,
+            Some(f.path()),
+        );
+        let line = format_trace_line(&r.traces[0]);
+        assert!(
+            line.contains("keychain://svc/acct -> <resolved, 24 chars>"),
+            "{line}"
+        );
+        assert!(!line.contains(secret));
+    }
+
+    #[test]
+    fn config_line_shows_unresolved_reference_for_bearer_names() {
+        // finding 8: the reference string is not a secret, show it
+        let runtime = HashMap::from([("API_KEY".to_string(), "op://v/i/f".to_string())]);
+        let r = resolve_plain(
+            &runtime,
+            &HashMap::new(),
+            &*Rec::ok("never"),
+            &["*"],
+            ResolveMode::ReferencesAsIs,
+            None,
+        );
+        assert!(!r.traces[0].secret);
+        assert!(r.secret_values().is_empty());
+        let line = format_trace_line(&r.traces[0]);
+        assert!(
+            line.contains("op://v/i/f (reference, not resolved)"),
+            "{line}"
+        );
+        assert!(!line.contains(MASK), "{line}");
+    }
+
+    #[test]
+    fn config_line_masks_literal_bearer_value_and_chain() {
+        let r = resolve_plain(
+            &HashMap::from([("API_KEY".to_string(), "runtime-literal-key".to_string())]),
+            &HashMap::from([("API_KEY".to_string(), "suite-literal-key-1".to_string())]),
+            &*Rec::err(),
+            &[],
+            ResolveMode::Resolve,
+            None,
+        );
+        let line = format_trace_line(&r.traces[0]);
+        assert!(!line.contains("literal-key"), "{line}");
+        assert!(line.contains(MASK));
+    }
+
+    #[test]
+    fn config_line_plain_var_unchanged() {
+        let r = resolve_plain(
+            &HashMap::from([("BASE_URL".to_string(), "http://x".to_string())]),
+            &HashMap::new(),
+            &*Rec::err(),
+            &[],
+            ResolveMode::Resolve,
+            None,
+        );
+        let line = format_trace_line(&r.traces[0]);
+        assert!(line.contains("http://x"));
+        assert!(line.contains("runtime(here)"));
+    }
+
+    #[test]
+    fn failure_blocks_requests_using_variable_or_bearer() {
+        let f = tmp_file("API_KEY=op://v/i/f\nOTHER=op://v/i/g\n");
+        let r = resolve_plain(
+            &HashMap::new(),
+            &HashMap::new(),
+            &*Rec::err(),
+            &["op://*"],
+            ResolveMode::Resolve,
+            Some(f.path()),
+        );
+        assert_eq!(r.failures.len(), 2);
+        let none: HashMap<String, String> = HashMap::new();
+        let b = blocking_failures(&r.failures, &r.vars, &[], &none, false);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].name(), "API_KEY");
+        assert!(blocking_failures(&r.failures, &r.vars, &[], &none, true).is_empty());
+        let b = blocking_failures(&r.failures, &r.vars, &["OTHER".to_string()], &none, true);
+        assert_eq!(b[0].name(), "OTHER");
+        let auth = HashMap::from([("authorization".to_string(), "x".to_string())]);
+        assert!(blocking_failures(&r.failures, &r.vars, &[], &auth, false).is_empty());
+    }
+
+    fn fail(name: &str) -> ResolveFailure {
+        ResolveFailure::SecretResolutionFailed {
+            name: name.to_string(),
+            reference: "keychain://svc/x".to_string(),
+            reason: "boom".to_string(),
+        }
+    }
+
+    #[test]
+    fn auto_bearer_selection_mirrors_inject_bearer() {
+        let none = HashMap::new();
+        let vars_bt = HashMap::from([("BEARER_TOKEN".to_string(), "bt-value".to_string())]);
+        let vars_both = HashMap::from([
+            ("API_KEY".to_string(), "ak-value".to_string()),
+            ("BEARER_TOKEN".to_string(), "bt-value".to_string()),
+        ]);
+        // (1) API_KEY failed -> block, no silent fallback to BEARER_TOKEN
+        let f = [fail("API_KEY")];
+        assert_eq!(bearer_plan(&vars_bt, &f), BearerPlan::Blocked("API_KEY"));
+        let b = blocking_failures(&f, &vars_bt, &[], &none, false);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].name(), "API_KEY");
+        // (2) API_KEY resolved -> a BEARER_TOKEN failure is irrelevant
+        let f = [fail("BEARER_TOKEN")];
+        assert_eq!(bearer_plan(&vars_both, &f), BearerPlan::Use("API_KEY"));
+        assert!(blocking_failures(&f, &vars_both, &[], &none, false).is_empty());
+        // (3) API_KEY absent and BEARER_TOKEN failed -> block
+        assert_eq!(bearer_plan(&none, &f), BearerPlan::Blocked("BEARER_TOKEN"));
+        let b = blocking_failures(&f, &none, &[], &none, false);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].name(), "BEARER_TOKEN");
+        // nothing defined
+        assert_eq!(bearer_plan(&none, &[]), BearerPlan::Off);
+    }
+
+    #[tokio::test]
+    async fn config_reports_blocked_auto_bearer_consistently_with_run() {
+        let env = tmp_file("API_KEY=keychain://evil/x\nBEARER_TOKEN=plain-bearer-token\n");
+        let srv = server_with(&["keychain://svc/*"], Rec::ok("unused-secret-val"));
+        let res = srv
+            .config(Parameters(McpConfigRequest {
+                env_file: env.path().to_str().map(|s| s.to_string()),
+                http_file: None,
+                variables: None,
+                filter: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&res);
+        assert!(
+            text.contains("auto-bearer: BLOCKED (API_KEY secret resolution failed)"),
+            "{text}"
+        );
+        assert!(!text.contains("auto-bearer: ON"), "{text}");
+    }
+
+    struct SlowRec {
+        calls: Mutex<Vec<String>>,
+    }
+    impl SecretBackend for SlowRec {
+        fn resolve(&self, reference: &str) -> Result<String, String> {
+            self.calls.lock().unwrap().push(reference.to_string());
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            Ok("slow-secret-value-1".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn overall_resolution_deadline_fails_remaining_references() {
+        let env = tmp_file("A=keychain://svc/a\nB=keychain://svc/b\nC=keychain://svc/c\n");
+        let backend = Arc::new(SlowRec {
+            calls: Default::default(),
+        });
+        let srv = ApiVerifierServer::new(SecretCtx {
+            allow: Arc::new(SecretAllowlist::new(["keychain://svc/*".to_string()])),
+            backend: backend.clone(),
+            os_env: Arc::new(|_| None),
+            budget: std::time::Duration::from_millis(50),
+        });
+        let res = srv
+            .config(Parameters(McpConfigRequest {
+                env_file: env.path().to_str().map(|s| s.to_string()),
+                http_file: None,
+                variables: None,
+                filter: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&res);
+        assert_eq!(backend.calls.lock().unwrap().len(), 1, "{text}");
+        assert_eq!(
+            text.matches("overall secret resolution deadline exceeded")
+                .count(),
+            2,
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_variable_is_reported_once_not_as_unresolved_warning() {
+        let (base, _hits) = spawn_echo().await;
+        let yaml = format!(
+            "variables:\n  BASE: \"{base}\"\nrequests:\n  - name: r\n    method: GET\n    url: \"{{{{BASE}}}}/p?k={{{{TOK}}}}&u={{{{NOPE}}}}\"\n    expect:\n      status: 200\n"
+        );
+        let suite = tmp_file(&yaml);
+        let env = tmp_file("TOK=keychain://svc/acct\n");
+        let srv = server_with(&["keychain://svc/*"], Rec::err());
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("o.json");
+        srv.run(Parameters(run_req(
+            suite.path().to_str(),
+            env.path().to_str().unwrap(),
+            out.to_str().unwrap(),
+            "json",
+        )))
+        .await
+        .unwrap();
+        let file = std::fs::read_to_string(&out).unwrap();
+        assert!(file.contains("SecretResolutionFailed"), "{file}");
+        // genuinely undefined NOPE is still warned about, TOK is not
+        assert!(file.contains("Unresolved variables: NOPE "), "{file}");
+    }
+
+    /// Minimal echo server: replies with the raw request head as the body.
+    /// Returns its base URL and a counter of requests received.
+    async fn spawn_echo() -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        buf.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.write_all(&buf).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn run_req(file: Option<&str>, env_file: &str, out: &str, format: &str) -> McpRunRequest {
+        McpRunRequest {
+            file: file.map(|s| s.to_string()),
+            request: None,
+            filter: None,
+            env_file: Some(env_file.to_string()),
+            variables: None,
+            stop_on_failure: None,
+            delay_ms: None,
+            timeout_ms: Some(5000),
+            format: Some(format.to_string()),
+            template: None,
+            body_max_lines: None,
+            output_file: Some(out.to_string()),
+            no_output_file: None,
+        }
+    }
+
+    fn suite_yaml(base: &str, url_tail: &str) -> String {
+        format!(
+            "variables:\n  BASE: \"{base}\"\nrequests:\n  - name: echo\n    method: GET\n    url: \"{{{{BASE}}}}/{url_tail}\"\n    headers:\n      X-Tok: \"{{{{TOK}}}}\"\n    expect:\n      status: 200\n      body_contains: [\"never-in-body\"]\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn run_handler_masks_summary_json_and_markdown() {
+        let secret = "handler-secret/token+1";
+        let (base, hits) = spawn_echo().await;
+        let suite = tmp_file(&suite_yaml(&base, "p?k={{TOK}}"));
+        let env = tmp_file("TOK=keychain://svc/acct\n");
+        let backend = Rec::ok(secret);
+        let srv = server_with(&["keychain://svc/*"], backend.clone());
+        let dir = tempfile::tempdir().unwrap();
+        for fmt in ["summary", "json", "markdown"] {
+            let out = dir.path().join(format!("out-{fmt}.txt"));
+            let req = run_req(
+                suite.path().to_str(),
+                env.path().to_str().unwrap(),
+                out.to_str().unwrap(),
+                fmt,
+            );
+            let res = srv.run(Parameters(req)).await.unwrap();
+            let text = result_text(&res);
+            let file = std::fs::read_to_string(&out).unwrap();
+            // raw, percent-encoded and json-escaped forms are all absent
+            for forbidden in [
+                secret,
+                "handler-secret%2Ftoken%2B1",
+                "handler-secret\\/token+1",
+            ] {
+                assert!(!text.contains(forbidden), "{fmt} summary: {text}");
+                assert!(!file.contains(forbidden), "{fmt} file: {file}");
+            }
+            assert!(file.contains("***"), "{fmt}: {file}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "requests really went out");
+        assert!(backend.calls().iter().all(|c| c == "keychain://svc/acct"));
+    }
+
+    #[tokio::test]
+    async fn run_handler_rejects_agent_supplied_env_file_reference() {
+        let (base, hits) = spawn_echo().await;
+        let suite = tmp_file(&suite_yaml(&base, "p?k={{TOK}}"));
+        // the agent controls env_file: this reference is not on the allowlist
+        let env = tmp_file("TOK=keychain://evil/acct\n");
+        let backend = Rec::ok("must-never-be-fetched");
+        let srv = server_with(&["keychain://my-api-tests/*"], backend.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.json");
+        let req = run_req(
+            suite.path().to_str(),
+            env.path().to_str().unwrap(),
+            out.to_str().unwrap(),
+            "json",
+        );
+        let res = srv.run(Parameters(req)).await.unwrap();
+        assert!(result_text(&res).contains("1 failed"));
+        assert!(backend.calls().is_empty(), "backend must not be called");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "request must not be sent");
+        let file = std::fs::read_to_string(&out).unwrap();
+        assert!(file.contains("SecretResolutionFailed"), "{file}");
+        assert!(file.contains("not allowed by --secret-ref-allow"), "{file}");
+        assert!(file.contains("secret_resolution"), "{file}");
+        assert!(!file.contains("must-never-be-fetched"));
+    }
+
+    #[tokio::test]
+    async fn run_handler_without_any_allow_flag_rejects_references() {
+        let (base, hits) = spawn_echo().await;
+        let suite = tmp_file(&suite_yaml(&base, "p"));
+        let env = tmp_file("TOK=op://Dev/item/field\n");
+        let backend = Rec::ok("must-never-be-fetched");
+        let srv = server_with(&[], backend.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("o.json");
+        let res = srv
+            .run(Parameters(run_req(
+                suite.path().to_str(),
+                env.path().to_str().unwrap(),
+                out.to_str().unwrap(),
+                "json",
+            )))
+            .await
+            .unwrap();
+        assert!(result_text(&res).contains("1 failed"));
+        assert!(backend.calls().is_empty());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn default_syntax_does_not_mask_a_failed_secret() {
+        let (base, hits) = spawn_echo().await;
+        let yaml = format!(
+            "variables:\n  BASE: \"{base}\"\nrequests:\n  - name: dflt\n    method: GET\n    url: \"{{{{BASE}}}}/p?k=${{TOK:fallback}}\"\n    expect:\n      status: 200\n"
+        );
+        let suite = tmp_file(&yaml);
+        let env = tmp_file("TOK=keychain://svc/acct\n");
+        let srv = server_with(&["keychain://svc/*"], Rec::err());
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("o.json");
+        let res = srv
+            .run(Parameters(run_req(
+                suite.path().to_str(),
+                env.path().to_str().unwrap(),
+                out.to_str().unwrap(),
+                "json",
+            )))
+            .await
+            .unwrap();
+        assert!(result_text(&res).contains("1 failed"));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "must be blocked, not defaulted"
+        );
+        let file = std::fs::read_to_string(&out).unwrap();
+        assert!(file.contains("SecretResolutionFailed"), "{file}");
+    }
+
+    fn inline_req(url: &str, vars: &[(&str, &str)]) -> McpRunRequest {
+        McpRunRequest {
+            file: None,
+            request: Some(InlineRequest {
+                method: "GET".into(),
+                url: url.into(),
+                headers: Some(HashMap::from([(
+                    "X-Tok".to_string(),
+                    "{{TOK}}".to_string(),
+                )])),
+                body: None,
+            }),
+            filter: None,
+            env_file: None,
+            variables: Some(
+                vars.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            stop_on_failure: None,
+            delay_ms: None,
+            timeout_ms: Some(5000),
+            format: None,
+            template: None,
+            body_max_lines: None,
+            output_file: None,
+            no_output_file: Some(true),
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_request_with_allowlisted_runtime_reference_is_masked() {
+        let secret = "inline-secret-token-9";
+        let (base, hits) = spawn_echo().await;
+        let backend = Rec::ok(secret);
+        let srv = server_with(&["keychain://svc/*"], backend.clone());
+        let res = srv
+            .run(Parameters(inline_req(
+                &format!("{base}/p?k={{{{TOK}}}}"),
+                &[("TOK", "keychain://svc/rt")],
+            )))
+            .await
+            .unwrap();
+        let text = result_text(&res);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.calls(), vec!["keychain://svc/rt".to_string()]);
+        assert!(!text.contains(secret), "{text}");
+        assert!(text.contains("***"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn inline_request_rejects_non_allowlisted_runtime_reference() {
+        let (base, hits) = spawn_echo().await;
+        let backend = Rec::ok("never");
+        let srv = server_with(&["keychain://svc/*"], backend.clone());
+        let err = srv
+            .run(Parameters(inline_req(
+                &format!("{base}/p?k={{{{TOK}}}}"),
+                &[("TOK", "keychain://other/x")],
+            )))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not allowed by --secret-ref-allow"));
+        assert!(backend.calls().is_empty());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn inline_request_transport_error_is_masked() {
+        let secret = "inline-err-secret-77";
+        let srv = server_with(&["keychain://svc/*"], Rec::ok(secret));
+        // port 1: connection refused; the URL (with the secret) must not leak
+        let err = srv
+            .run(Parameters(inline_req(
+                "http://127.0.0.1:1/p?k={{TOK}}",
+                &[("TOK", "keychain://svc/rt")],
+            )))
+            .await
+            .unwrap_err();
+        assert!(!err.message.contains(secret), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn config_handler_hides_value_and_reports_disallowed() {
+        let secret = "config-secret-value-5";
+        let env = tmp_file("API_KEY=keychain://svc/acct\nBAD=keychain://evil/x\nPLAIN=hi\n");
+        let backend = Rec::ok(secret);
+        let srv = server_with(&["keychain://svc/*"], backend.clone());
+        let res = srv
+            .config(Parameters(McpConfigRequest {
+                env_file: env.path().to_str().map(|s| s.to_string()),
+                http_file: None,
+                variables: None,
+                filter: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&res);
+        assert!(!text.contains(secret), "{text}");
+        assert!(
+            text.contains("keychain://svc/acct -> <resolved, 21 chars>"),
+            "{text}"
+        );
+        assert!(text.contains("not allowed by --secret-ref-allow"), "{text}");
+        assert!(text.contains("PLAIN"), "{text}");
+        assert_eq!(backend.calls(), vec!["keychain://svc/acct".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn config_handler_counts_failed_dotenv_vars() {
+        let env = tmp_file("API_KEY=keychain://evil/x\nBASE=http://h\n");
+        let srv = server_with(&["keychain://svc/*"], Rec::ok("unused-secret-value"));
+        let count_line = |filter: Option<&str>| {
+            let srv = &srv;
+            let env_file = env.path().to_str().map(|s| s.to_string());
+            let filter = filter.map(|s| s.to_string());
+            async move {
+                let res = srv
+                    .config(Parameters(McpConfigRequest {
+                        env_file,
+                        http_file: None,
+                        variables: None,
+                        filter,
+                    }))
+                    .await
+                    .unwrap();
+                result_text(&res)
+            }
+        };
+        let all = count_line(None).await;
+        assert!(all.contains("not allowed by --secret-ref-allow"), "{all}");
+        assert!(all.contains("(2 vars)"), "{all}");
+        let filtered = count_line(Some("API_*")).await;
+        assert!(filtered.contains("(1 vars)"), "{filtered}");
+        assert!(filtered.contains("! "), "{filtered}");
+        let other = count_line(Some("BASE")).await;
+        assert!(!other.contains("! "), "{other}");
+        assert!(other.contains("$BASE"), "{other}");
+        assert!(other.contains("auto-bearer: BLOCKED"), "{other}");
+    }
+
+    #[tokio::test]
+    async fn parse_handler_never_invokes_backend_and_shows_references() {
+        let suite = tmp_file(
+            "variables:\n  API_KEY: \"keychain://svc/acct\"\n  BEARER_TOKEN: literal-bearer-value\n  BASE: http://h\nrequests:\n  - name: r\n    method: GET\n    url: \"{{BASE}}/x?t={{BEARER_TOKEN}}\"\n",
+        );
+        let backend = Rec::ok("must-never-be-fetched");
+        let srv = server_with(&["*"], backend.clone());
+        let res = srv
+            .parse(Parameters(McpParseRequest {
+                path: suite.path().to_str().unwrap().to_string(),
+                resolve_vars: Some(true),
+                env_file: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&res);
+        assert!(backend.calls().is_empty(), "parse must not call backends");
+        assert!(
+            text.contains("API_KEY = keychain://svc/acct (reference, not resolved)"),
+            "{text}"
+        );
+        assert!(!text.contains("literal-bearer-value"), "{text}");
+        assert!(!text.contains("must-never-be-fetched"));
+    }
+
+    #[tokio::test]
+    async fn resolved_api_key_reaches_the_wire_and_is_masked_in_output() {
+        let secret = "wire-secret-token-777";
+        let (base, _) = spawn_echo().await;
+        let f = tmp_file("API_KEY=keychain://svc/acct\n");
+        let resolved = resolve_plain(
+            &HashMap::new(),
+            &HashMap::new(),
+            &*Rec::ok(secret),
+            &["keychain://svc/*"],
+            ResolveMode::Resolve,
+            Some(f.path()),
+        );
+        let mut headers = HashMap::new();
+        assert_eq!(
+            inject_bearer(&mut headers, &resolved.vars, false),
+            Some("API_KEY".to_string())
+        );
+        let client = build_client().unwrap();
+        let mut resp = execute_request(&client, "GET", &format!("{base}/"), &headers, None, 5000)
+            .await
+            .unwrap();
+        assert!(
+            resp.body
+                .to_lowercase()
+                .contains(&format!("authorization: bearer {secret}").to_lowercase()),
+            "{}",
+            resp.body
+        );
+        let masker = Masker::new(resolved.secret_values());
+        masker.mask_response(&mut resp);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains(secret), "{json}");
     }
 }

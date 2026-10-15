@@ -40,6 +40,9 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
 proptest = "1"

@@ -100,6 +100,29 @@ Supported syntax: `{{VAR}}`, `${VAR}`, `${VAR:default}`, `$VAR`
 
 Priority: runtime parameters > suite `variables` > `.env` file > OS environment
 
+#### Secret references
+
+A value may reference a secret in an external store instead of containing it:
+
+```dotenv
+# .env
+API_KEY=keychain://my-api-tests/API_KEY   # macOS: security find-generic-password -s <service> -a <account> -w
+TOKEN=op://vault/item/field               # 1Password CLI: op read <ref>
+```
+
+- Resolved at run time, once per call, only for the winning value; no caching. Each backend CLI call has a 10 s timeout.
+- **Server-side allowlist.** A reference is resolved only if it matches a `--secret-ref-allow <pattern>` given on the server command line (repeatable; exact reference or `*` wildcard that also matches `/`), whatever its source (`.env`, suite `variables`, `run` `variables`). With no flag nothing is resolved. Because `env_file`, the suite and `variables` are controlled by the agent, the allowlist is the only trust boundary:
+
+  ```
+  rest-e2e-mcp --mcp --secret-ref-allow 'keychain://my-api-tests/*' --secret-ref-allow 'op://Dev/*'
+  ```
+- A reference that is not allowed, or cannot be resolved (CLI missing, item not found, timeout, empty output), makes every request that uses the variable (in any form, including `${NAME:default}`) fail with `SecretResolutionFailed`; the literal reference is never sent and there is no fallback to a default or an empty value.
+- OS environment: the process environment is only consulted for names that also appear in runtime `variables`, the suite or the `.env` file, and it has the lowest priority, so a reference placed only in the OS environment is never reached.
+- `parse` never runs secret CLIs: references are shown unresolved.
+- Masking: the `Authorization` header value is always `***`; resolved values and the values of `API_KEY` / `BEARER_TOKEN` (8+ characters) are replaced with `***` in the summary, markdown/json reports and custom templates, also in their percent-encoded (URL/form) and JSON-escaped forms. Other transformed forms (base64, hex, ...) are **not** masked. `config` shows `<reference> -> <resolved, N chars>`, never the value.
+
+See `resources/guides/variables.md` for details.
+
 ### Request Options
 
 ```yaml

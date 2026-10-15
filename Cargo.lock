@@ -1310,6 +1310,7 @@ dependencies = [
  "dotenvy",
  "encoding_rs",
  "insta",
+ "libc",
  "minijinja",
  "proptest",
  "regex",
