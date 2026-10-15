@@ -26,10 +26,10 @@ use crate::parser::load_suite;
 use crate::report::render;
 use crate::secret::{CliBackend, MASK, Masker, SecretAllowlist, SecretBackend, is_reference};
 use crate::types::{
-    Failure, ResolveFailure, ResolvedVars, SuiteResult, TestResult, TestSuite, VarSource, VarTrace,
+    Failure, ResolveFailure, ResolvedVars, SuiteResult, TestResult, TestSuite, VarTrace,
 };
 use crate::variable::{
-    ResolveMode, resolve_variables_in, substitute, substitute_with_check_failed,
+    ResolveMode, load_dotenv, resolve_variables_in, substitute, substitute_with_check_failed,
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 30000;
@@ -830,18 +830,18 @@ impl ApiVerifierServer {
             )
             .await?;
 
-        // フィルタ適用
-        let traces: Vec<VarTrace> = if let Some(filter) = &req.filter {
-            let pattern = normalize_pattern(filter);
-            resolved
-                .traces
-                .clone()
-                .into_iter()
-                .filter(|t| matches_simple_pattern(&t.name, &pattern))
-                .collect()
-        } else {
-            resolved.traces.clone()
+        // フィルタ適用（変数行・失敗行・.env件数で共通）
+        let pattern = req.filter.as_deref().map(normalize_pattern);
+        let selected = |name: &str| {
+            pattern
+                .as_deref()
+                .is_none_or(|p| matches_simple_pattern(name, p))
         };
+        let traces: Vec<&VarTrace> = resolved
+            .traces
+            .iter()
+            .filter(|t| selected(&t.name))
+            .collect();
 
         // Mise風出力
         let mut output = String::new();
@@ -850,7 +850,7 @@ impl ApiVerifierServer {
             output.push_str(&format_trace_line(trace));
             output.push('\n');
         }
-        for f in &resolved.failures {
+        for f in resolved.failures.iter().filter(|f| selected(f.name())) {
             output.push_str(&format!("! {}\n", f.to_failure().actual));
         }
 
@@ -871,9 +871,10 @@ impl ApiVerifierServer {
         // ファイルロード情報
         output.push('\n');
         if let Some(env_path) = &req.env_file {
-            let count = traces
-                .iter()
-                .filter(|t| t.found_in.iter().any(|(s, _)| *s == VarSource::DotEnv))
+            // 解決に失敗した変数は traces に入らないため、.env の変数名から数える
+            let count = load_dotenv(Some(std::path::Path::new(env_path)))
+                .keys()
+                .filter(|n| selected(n))
                 .count();
             output.push_str(&format!("files: .env={env_path} ({count} vars)\n"));
         }
@@ -1989,6 +1990,39 @@ mod tests {
         assert!(text.contains("not allowed by --secret-ref-allow"), "{text}");
         assert!(text.contains("PLAIN"), "{text}");
         assert_eq!(backend.calls(), vec!["keychain://svc/acct".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn config_handler_counts_failed_dotenv_vars() {
+        let env = tmp_file("API_KEY=keychain://evil/x\nBASE=http://h\n");
+        let srv = server_with(&["keychain://svc/*"], Rec::ok("unused-secret-value"));
+        let count_line = |filter: Option<&str>| {
+            let srv = &srv;
+            let env_file = env.path().to_str().map(|s| s.to_string());
+            let filter = filter.map(|s| s.to_string());
+            async move {
+                let res = srv
+                    .config(Parameters(McpConfigRequest {
+                        env_file,
+                        http_file: None,
+                        variables: None,
+                        filter,
+                    }))
+                    .await
+                    .unwrap();
+                result_text(&res)
+            }
+        };
+        let all = count_line(None).await;
+        assert!(all.contains("not allowed by --secret-ref-allow"), "{all}");
+        assert!(all.contains("(2 vars)"), "{all}");
+        let filtered = count_line(Some("API_*")).await;
+        assert!(filtered.contains("(1 vars)"), "{filtered}");
+        assert!(filtered.contains("! "), "{filtered}");
+        let other = count_line(Some("BASE")).await;
+        assert!(!other.contains("! "), "{other}");
+        assert!(other.contains("$BASE"), "{other}");
+        assert!(other.contains("auto-bearer: BLOCKED"), "{other}");
     }
 
     #[tokio::test]

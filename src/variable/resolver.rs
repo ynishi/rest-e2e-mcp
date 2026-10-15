@@ -344,7 +344,7 @@ fn substitute_inner(
 }
 
 /// .envファイルを読み込む。
-fn load_dotenv(path: Option<&Path>) -> HashMap<String, String> {
+pub(crate) fn load_dotenv(path: Option<&Path>) -> HashMap<String, String> {
     let mut map = HashMap::new();
     if let Some(path) = path
         && path.exists()
