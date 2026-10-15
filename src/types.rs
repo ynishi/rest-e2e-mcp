@@ -156,6 +156,14 @@ pub struct VarTrace {
     pub source: VarSource,
     /// この変数が見つかった全ソースと値。低い優先順位から高い順。
     pub found_in: Vec<(VarSource, String)>,
+    /// シークレットとして扱うか（参照から解決された、または API_KEY / BEARER_TOKEN のリテラル値）。
+    /// 未解決の参照文字列そのものはシークレットではない。
+    #[serde(default)]
+    pub secret: bool,
+    /// 勝者の値が参照だった場合の参照文字列 (`keychain://...` / `op://...`)。参照自体はシークレットではない。
+    /// `secret == true` なら解決済み、`false` なら未解決のまま（parse）。
+    #[serde(default)]
+    pub reference: Option<String>,
 }
 
 /// 解決済み変数セット。
@@ -163,6 +171,56 @@ pub struct VarTrace {
 pub struct ResolvedVars {
     pub vars: HashMap<String, String>,
     pub traces: Vec<VarTrace>,
+    /// シークレット参照の解決失敗（許可リスト外 / CLI 失敗等）。該当変数は `vars` に含まれない。
+    pub failures: Vec<ResolveFailure>,
+}
+
+impl ResolvedVars {
+    /// マスク対象のシークレット値。
+    pub fn secret_values(&self) -> Vec<String> {
+        self.traces
+            .iter()
+            .filter(|t| t.secret)
+            .map(|t| t.value.clone())
+            .collect()
+    }
+}
+
+/// 変数解決段階の失敗。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResolveFailure {
+    /// シークレット参照を解決できなかった（CLI 不在 / 非 0 終了 / 空出力など）。
+    SecretResolutionFailed {
+        name: String,
+        reference: String,
+        /// 固定の理由文字列（解決値・CLI 出力は含まない）。
+        reason: String,
+    },
+}
+
+impl ResolveFailure {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::SecretResolutionFailed { name, .. } => name,
+        }
+    }
+
+    /// レポート用の [`Failure`] へ変換。解決値・CLI 出力は含まない。
+    pub fn to_failure(&self) -> Failure {
+        match self {
+            Self::SecretResolutionFailed {
+                name,
+                reference,
+                reason,
+            } => Failure {
+                check: "secret_resolution".to_string(),
+                expected: format!("secret reference for ${name} resolvable"),
+                actual: format!(
+                    "SecretResolutionFailed: could not resolve {reference} for ${name} ({reason})"
+                ),
+            },
+        }
+    }
 }
 
 // =============================================================================

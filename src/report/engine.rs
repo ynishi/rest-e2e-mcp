@@ -138,4 +138,52 @@ mod tests {
         assert!(output.contains("1 passed"));
         assert!(output.contains("1 failed"));
     }
+
+    fn secret_suite(secret: &str) -> SuiteResult {
+        let mut r = make_test_result("auth", false, 401);
+        r.request_url = format!("https://example.com/?token={secret}");
+        r.request_headers
+            .insert("authorization".to_string(), format!("Bearer {secret}"));
+        r.request_body = Some(format!("{{\"t\":\"{secret}\"}}"));
+        r.response_preview = format!("echo {secret}");
+        r.failures.push(crate::types::Failure {
+            check: "body".into(),
+            expected: "ok".into(),
+            actual: format!("saw {secret}"),
+        });
+        make_suite(vec![r])
+    }
+
+    #[test]
+    fn masked_markdown_and_json_reports_hide_secret() {
+        let secret = "report-secret-abcdef";
+        let masker = crate::secret::Masker::new([secret.to_string()]);
+        let mut suite = secret_suite(secret);
+        // sanity: unmasked markdown does leak (proves the test is meaningful)
+        assert!(render(&suite, None, None).unwrap().contains(secret));
+
+        masker.mask_suite(&mut suite);
+        let md = render(&suite, None, None).unwrap();
+        assert!(!md.contains(secret), "{md}");
+        assert!(md.contains("***"));
+        let json = serde_json::to_string_pretty(&suite).unwrap();
+        assert!(!json.contains(secret), "{json}");
+
+        // custom template sees masked data too
+        let custom = render(
+            &suite,
+            Some("{% for r in results %}{% for k, v in r.request_headers|items %}{{ k }}={{ v }}{% endfor %}{{ r.request_url }}{% endfor %}"),
+            None,
+        )
+        .unwrap();
+        assert!(!custom.contains(secret), "{custom}");
+    }
+
+    #[test]
+    fn authorization_header_masked_without_known_secret() {
+        let mut suite = secret_suite("short");
+        crate::secret::Masker::default().mask_suite(&mut suite);
+        let md = render(&suite, None, None).unwrap();
+        assert!(!md.contains("Bearer short"), "{md}");
+    }
 }

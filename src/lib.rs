@@ -3,5 +3,6 @@ pub mod http;
 pub mod mcp;
 pub mod parser;
 pub mod report;
+pub mod secret;
 pub mod types;
 pub mod variable;
