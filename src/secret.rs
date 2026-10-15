@@ -884,38 +884,66 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_cli_setsid_grandchild_holding_pipe_returns_bounded() {
-        if Command::new("setsid").arg("--version").output().is_err() {
-            eprintln!("setsid not available; skipping");
-            return;
+        // There is no `setsid` command on macOS, so the escapee calls
+        // POSIX::setsid() from perl (present on Linux and macOS). It writes its
+        // pid to the guard file, then `exec`s sleep, keeping the same pid.
+        // Paths go in as arguments, so no shell quoting is involved.
+        const ESCAPE: &str = "perl -MPOSIX -e 'POSIX::setsid() or die; \
+             open(my $f, \">\", $ARGV[0]) or die; print $f $$; close $f; \
+             exec \"sleep\", $ARGV[1]' \"$1\" \"$2\"";
+        assert!(
+            Command::new("perl").arg("-v").output().is_ok(),
+            "perl is required for this test"
+        );
+        // The recorded pid must be a session leader, i.e. it really left the group.
+        fn assert_escaped(g: &PidGuard) {
+            let t = Instant::now();
+            let pid = loop {
+                if let Ok(s) = std::fs::read_to_string(&g.0)
+                    && let Ok(p) = s.trim().parse::<i32>()
+                {
+                    break p;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(3),
+                    "escapee never started"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            // SAFETY: getsid only queries the given pid.
+            assert_eq!(unsafe { libc::getsid(pid) }, pid, "escapee did not setsid");
         }
+
         let g1 = PidGuard::new("setsid1");
-        let g2 = PidGuard::new("setsid2");
-        // `exec` keeps the recorded pid equal to the sleeping process.
         let mut cmd = Command::new("sh");
         cmd.args([
             "-c",
-            &format!(
-                "echo ok; setsid sh -c 'echo $$ > \'{}\'; exec sleep 31' & exit 0",
-                g1.path()
-            ),
+            &format!("echo ok; {ESCAPE} & exit 0"),
+            "sh",
+            &g1.path(),
+            "31",
         ]);
         let t = Instant::now();
         let out = run_cli(cmd, Duration::from_secs(5)).unwrap();
         assert_eq!(out, b"ok\n");
         assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert_escaped(&g1);
+
         // timeout path with the same escapee
+        let g2 = PidGuard::new("setsid2");
         let mut cmd = Command::new("sh");
         cmd.args([
             "-c",
-            &format!(
-                "setsid sh -c 'echo $$ > \'{}\'; exec sleep 32' & sleep 31",
-                g2.path()
-            ),
+            &format!("{ESCAPE} & sleep 31"),
+            "sh",
+            &g2.path(),
+            "32",
         ]);
         let t = Instant::now();
-        let err = run_cli(cmd, Duration::from_millis(200)).unwrap_err();
+        let err = run_cli(cmd, Duration::from_millis(1000)).unwrap_err();
         assert!(err.contains("timed out"), "{err}");
         assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert_escaped(&g2);
         // the escaped sleeps are outside the group on purpose; guards kill them
     }
 
